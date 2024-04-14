@@ -1,6 +1,7 @@
 #include "VulkanCore.h"
 #include <iostream>
 
+#include <optional>
 
 namespace renderer::vulkan
 {
@@ -10,6 +11,18 @@ namespace renderer::vulkan
 		// bool						enable_validation_layers;
 		VkDebugUtilsMessengerEXT	debug_messenger;
 		VkPhysicalDevice			device{ VK_NULL_HANDLE };
+		VkDevice					logical_device;
+		VkQueue						graphics_queue;
+
+		struct
+		{
+			std::optional<uint32_t> graphics_family;
+
+			bool is_complete()
+			{
+				return graphics_family.has_value();
+			}
+		}queue_family_indices;
 
 		static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
 															 VkDebugUtilsMessageTypeFlagsEXT message_type,
@@ -151,7 +164,27 @@ namespace renderer::vulkan
 			VkPhysicalDeviceFeatures device_features;
 			vkGetPhysicalDeviceFeatures(device, &device_features);
 
-			return true;
+			uint32_t queue_family_count = 0;
+			vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, nullptr);
+
+			std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
+			vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, queue_families.data());
+
+			bool has_graphics_queue_family{ false };
+			int i{ 0 };
+			for (const auto& family : queue_families)
+			{
+				if (family.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+					has_graphics_queue_family = true;
+					queue_family_indices.graphics_family = i;
+					break;
+				}
+				++i;
+			}
+
+			return has_graphics_queue_family && 
+				   device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && 
+				   device_features.geometryShader;
 		}
 
 		void pick_physical_device()
@@ -201,13 +234,13 @@ namespace renderer::vulkan
 		create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 		create_info.pApplicationInfo = &app_info;
 
+#ifdef _DEBUG
+		VkDebugUtilsMessengerCreateInfoEXT debug_create_info{};
+		
 		// setting validation layers
 		const std::vector<const char*> validation_layers = {
 			"VK_LAYER_KHRONOS_validation"
 		};
-
-		VkDebugUtilsMessengerCreateInfoEXT debug_create_info{};
-#ifdef _DEBUG
 
 		if (!check_validation_layers_support(validation_layers))
 		{
@@ -241,11 +274,50 @@ namespace renderer::vulkan
 		if (!vk_instance) return false;
 
 #if _DEBUG
-		VkDebugUtilsMessengerCreateInfoEXT create_dm_info;
-		populate_debug_messenger_create_info(create_dm_info);
+		VkDebugUtilsMessengerCreateInfoEXT create_debug_messenger_info;
+		populate_debug_messenger_create_info(create_debug_messenger_info);
 
-		VKCALL(proxy_create_debug_utils_messenger_ext(&create_dm_info, nullptr), "failed to setup debug messenger!");
+		VKCALL(proxy_create_debug_utils_messenger_ext(&create_debug_messenger_info, nullptr), "failed to setup debug messenger!");
 #endif
+
+		pick_physical_device();
+
+		// creating grpahics queue
+		float graphics_queue_priority{ 1.f };
+		assert(queue_family_indices.is_complete());
+		VkDeviceQueueCreateInfo queue_create_info{};
+		queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+		queue_create_info.queueFamilyIndex = queue_family_indices.graphics_family.value();
+		queue_create_info.queueCount = 1; // for now we are only interested in a queue with graphics capabilities
+		queue_create_info.pQueuePriorities = &graphics_queue_priority;
+
+		// specifying used device features
+		VkPhysicalDeviceFeatures device_features{}; // leave empty for now
+
+		// create logical device
+		VkDeviceCreateInfo logical_device_create_info{};
+		logical_device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+		logical_device_create_info.pQueueCreateInfos = &queue_create_info;
+		logical_device_create_info.queueCreateInfoCount = 1;
+		logical_device_create_info.pEnabledFeatures = &device_features;
+
+		// specifying device specific extensions and validation layers
+		logical_device_create_info.enabledExtensionCount = 0;
+
+		// in order to be compatible with older vulkan implementations, keep the distinction between 
+		// instance and device specific validation layers
+#ifdef _DEBUG
+		logical_device_create_info.enabledLayerCount = static_cast<uint32_t>(validation_layers.size());
+		logical_device_create_info.ppEnabledLayerNames = validation_layers.data();
+#else
+		logical_device_create_info.enabledLayerCount = 0;
+#endif
+		VKCALL(vkCreateDevice(device, &logical_device_create_info, nullptr, &logical_device), "failed to setup logical device!");
+		assert(logical_device);
+		if (!logical_device) return false;
+
+		// retreive graphics queue handle
+		vkGetDeviceQueue(logical_device, queue_family_indices.graphics_family.value(), 0, &graphics_queue);
 
 		return true;
 	}
@@ -255,7 +327,7 @@ namespace renderer::vulkan
 #if _DEBUG
 		proxy_destroy_debug_utils_messenger_ext(nullptr);
 #endif
-
+		vkDestroyDevice(logical_device, nullptr);
 		vkDestroyInstance(vk_instance, nullptr);
 	}
 
